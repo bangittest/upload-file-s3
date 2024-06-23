@@ -1,0 +1,805 @@
+package com.wfs.core.service.invoice.impl;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
+
+import com.wfs.common.enums.*;
+import com.wfs.common.repository.invoice.InvAttmRepository;
+import com.wfs.common.util.DateUtils;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.modelmapper.ModelMapper;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import com.wfs.common.component.MessageResource;
+import com.wfs.common.constant.ApplicationConstant.MailConstant;
+import com.wfs.common.constant.LogErrorMessConstant;
+import com.wfs.common.dto.ChangeStatusDto;
+import com.wfs.common.dto.HistoryDto;
+import com.wfs.common.dto.auth.UserLoginDto;
+import com.wfs.common.dto.file.FileUploadReqDto.FileItemMergeSet;
+import com.wfs.common.dto.invoice.CommonModifyData;
+import com.wfs.common.dto.master.mail.ParamMailCodeDto;
+import com.wfs.common.entity.GenMst;
+import com.wfs.common.entity.InvAssign;
+import com.wfs.common.entity.InvLogHist;
+import com.wfs.common.entity.InvTrans;
+import com.wfs.common.enums.GenMstEnum.ItemCdEnum;
+import com.wfs.common.enums.InvoiceEnum.AssignTypeEnum;
+import com.wfs.common.exception.CommonException;
+import com.wfs.common.repository.invoice.InvAssignRepository;
+import com.wfs.common.repository.invoice.InvLogHistRepository;
+import com.wfs.common.repository.invoice.InvTransRepository;
+import com.wfs.common.repository.master.generalmaster.GenMstRepository;
+import com.wfs.common.repository.master.user.UserMstRepository;
+import com.wfs.common.util.AuthUtils;
+import com.wfs.common.util.StringUtils;
+import com.wfs.core.service.base.MailSystemService;
+import com.wfs.core.service.invoice.GenStaffService;
+import com.wfs.core.service.invoice.InvoiceFileService;
+import com.wfs.core.service.invoice.StaffClaimPDFService;
+import com.wfs.core.service.master.BaseMstSettingService;
+import com.wfs.core.service.master.FileSystemService;
+import lombok.extern.slf4j.Slf4j;
+
+@Service
+@Slf4j
+public class GenStaffImpl implements GenStaffService {
+
+    private final GenMstRepository genMstRepository;
+
+    private final InvLogHistRepository invLogHistRepository;
+    private final InvAttmRepository invAttmRepository;
+    private final InvTransRepository invTransRepository;
+    private final MessageResource messageResource;
+    private final InvAssignRepository invAssignRepository;
+    private final BaseMstSettingService baseMstSettingService;
+    private final ModelMapper modelMapper;
+    private final StaffClaimPDFService staffClaimPDFService;
+    private final FileSystemService fileSystemService;
+    private final InvoiceFileService invoiceFileService;
+    private final MailSystemService mailSystemService;
+    private final UserMstRepository userMstRepository;
+    @Value("${web.host}")
+    private String webHost;
+
+    public GenStaffImpl(GenMstRepository genMstRepository, InvLogHistRepository invLogHistRepository, InvAttmRepository invAttmRepository, InvTransRepository invTransRepository,
+                        MessageResource messageResource, InvAssignRepository invAssignRepository,
+                        BaseMstSettingService baseMstSettingService,
+                        ModelMapper modelMapper, StaffClaimPDFService staffClaimPDFService, FileSystemService fileSystemService,
+                        InvoiceFileService invoiceFileService, MailSystemService mailSystemService, UserMstRepository userMstRepository) {
+        this.genMstRepository = genMstRepository;
+        this.invLogHistRepository = invLogHistRepository;
+        this.invAttmRepository = invAttmRepository;
+        this.invTransRepository = invTransRepository;
+        this.messageResource = messageResource;
+        this.invAssignRepository = invAssignRepository;
+
+        this.baseMstSettingService = baseMstSettingService;
+        this.modelMapper = modelMapper;
+        this.staffClaimPDFService = staffClaimPDFService;
+        this.fileSystemService = fileSystemService;
+        this.invoiceFileService = invoiceFileService;
+        this.mailSystemService = mailSystemService;
+        this.userMstRepository = userMstRepository;
+    }
+
+
+//    - Ở step AP/AM muốn reject/approval thì cần tất cả INV_ATTM.READ_FG (của REQ_NO) đều = 'Y' (check InvAttmRepository.countCheckAttmNotRead)
+//            - Khi AP action reject/approval, sẽ reset toàn bộ INV_ATTM(của REQ_NO) -> READ_FG = 'N'
+//           - Khi AM action reject, sẽ reset toàn bộ INV_ATTM(của REQ_NO) -> READ_FG = 'N'
+//            (check InvAttmRepository.updateReadFgByReqNo để reset)
+//
+//            - Kiểm tra REQ_TYPE = 2 (Staff Claim HR)
+//           - Kiểm tra trạng thái REQ_STATUS = 2 (PIC Submited)
+//            - Lấy INV_ASSIGN với assign_type = 1 && 2, và assigner == userLogin.staffNo
+//- Nếu có assign_type = 1 (HRC), cho thằng HRC thực hiện action
+//Reset INV_TRANS.REQ_VIEW_FG = 'N' khi approve/reject
+//- Nếu không có assign_type = 1 (HRC), -> chuyển sang assign_type = 2 (HRM), cho thằng HRM thực hiện action
+//- Kiểm tra trạng thái REQ_STATUS = 10 (HRC Approved)
+//            - Lấy INV_ASSIGN với assign_type 2, và assigner == userLogin.staffNo
+//Cho phép HRM thực hiện action
+//Reset INV_TRANS.REQ_VIEW_FG = 'N' khi approve/reject
+//- Kiểm tra trạng thái REQ_STATUS = 12 (HRM Approved)
+//            - Lấy INV_ASSIGN với assign_type 0, và assigner == userLogin.staffNo
+//Cho phép DA thực hiện action
+//Reset INV_TRANS.REQ_VIEW_FG = 'N' khi reject
+//- Kiểm tra trạng thái REQ_STATUS = 14 (AP Saved)
+//            - Lấy INV_ASSIGN với assign_type 6, và assigner == userLogin.staffNo
+//Cho phép AP thực hiện action
+//- Kiểm tra trạng thái REQ_STATUS = 15 (AP Approved)
+//            - Lấy INV_ASSIGN với assign_type 4, và assigner == userLogin.staffNo
+//Cho phép AM thực hiện action
+//
+//        - Kiểm tra REQ_TYPE = 1 (Staff Claim)
+//            - Kiểm tra trạng thái REQ_STATUS = 2 (PIC Submitted)
+//            - Lấy INV_ASSIGN với assign_type 0, và assigner == userLogin.staffNo
+//Cho phép DA thực hiện action
+//Reset INV_TRANS.REQ_VIEW_FG = 'N' khi reject
+//- Kiểm tra trạng thái REQ_STATUS = 14 (AP Saved)
+//            - Lấy INV_ASSIGN với assign_type 6, và assigner == userLogin.staffNo
+//Cho phép AP thực hiện action
+//- Kiểm tra trạng thái REQ_STATUS = 15 (AP Approved)
+//            - Lấy INV_ASSIGN với assign_type 4, và assigner == userLogin.staffNo
+//Cho phép AM thực hiện action
+
+    @Override
+    @Transactional(rollbackFor = {Exception.class, Throwable.class})
+    public CommonModifyData approvalStaffInvoice(ChangeStatusDto changeStatusDto, String reqNo) throws CommonException {
+        try {
+            CommonModifyData commonModifyData =null;
+            // Lấy thông tin người dùng hiện tại
+            UserLoginDto userLoginDto = AuthUtils.getCurrentUser();
+
+            // Lấy thông tin giao dịch hóa đơn từ cơ sở dữ liệu
+            List<String> stringList = Arrays.asList(StringUtils.CHAR_1, StringUtils.CHAR_2);
+            InvTrans invTrans = invTransRepository.getByCompanyCdAndReqNoAndReqTypeIn(userLoginDto.getCompanyCd(), reqNo, stringList)
+                    .orElseThrow(() -> new CommonException().setStatusCode(HttpStatus.NOT_FOUND)
+                            .setErrorCode(SystemCodeEnum.ER_SAB1_003.getCode(), messageResource, reqNo));
+
+            // Kiểm tra REQ_TYPE 2
+            if (InvoiceEnum.ReqTypeEnum.STAFF_CLAIM_HR.getType().equals(invTrans.getReqType())) {
+                // Kiểm tra trạng thái REQ_STATUS
+                switch (InvoiceEnum.valueOfByStatus(invTrans.getReqStatus())) {
+                    case PIC_SUBMITTED:
+                        // Tìm người được giao việc là HRC hoặc HRM
+                        if (checkInvAssign(reqNo,userLoginDto,AssignTypeEnum.HR_C) != null) {
+                            // Cho thằng HRC thực hiện action
+                            commonModifyData = handleHRCAction(changeStatusDto,invTrans,userLoginDto);
+                            invTrans.setReqViewFg(StringUtils.READ_FG_NO);
+                        } else if (checkInvAssign(reqNo,userLoginDto,AssignTypeEnum.HR_M )!= null) {
+                            // Cho thằng HRM thực hiện action
+                            commonModifyData = handleHRMAction(changeStatusDto,invTrans,userLoginDto);
+                            invTrans.setReqViewFg(StringUtils.READ_FG_NO);
+                        } else {
+                            throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+                                    .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+                        }
+                        break;
+                    case HRC_APPROVED:
+                        // Lấy người được giao việc là HRM
+                        if (checkInvAssign(reqNo,userLoginDto,AssignTypeEnum.HR_M) != null) {
+                            // Cho thằng HRM thực hiện action
+                            commonModifyData = handleHRMAction(changeStatusDto,invTrans,userLoginDto);
+                            invTrans.setReqViewFg(StringUtils.READ_FG_NO);
+                        } else {
+                            throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+                                    .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+                        }
+                        break;
+                    case HRM_APPROVED:
+                        // Lấy người được giao việc là DA
+                        if (checkInvAssign(reqNo,userLoginDto,AssignTypeEnum.DA) != null) {
+                            // Cho thằng DA thực hiện action
+                            commonModifyData = handleDAAction(changeStatusDto,invTrans,userLoginDto);
+                            invTrans.setReqViewFg(StringUtils.READ_FG_NO);
+                        } else {
+                            throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+                                    .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+                        }
+                        break;
+                    case AP_SAVED:
+                        // Lấy người được giao việc là AP
+                        if (checkInvAssign(reqNo,userLoginDto,AssignTypeEnum.AP) != null) {
+                            // Cho thằng AP thực hiện action
+                            commonModifyData = handleAPAction(changeStatusDto,invTrans,userLoginDto);
+                        } else {
+                            throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+                                    .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+                        }
+                        break;
+                    case AP_APPROVED:
+                        // Lấy người được giao việc là AM
+                        if (checkInvAssign(reqNo,userLoginDto,AssignTypeEnum.AM) != null) {
+                            // Cho thằng AM thực hiện action
+                            commonModifyData = handleAMAction(changeStatusDto,invTrans,userLoginDto);
+                        } else {
+                            throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+                                    .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+                        }
+                        break;
+                    default:
+                        throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+                                .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+                }
+            } else if (InvoiceEnum.ReqTypeEnum.STAFF_CLAIM.getType().equals(invTrans.getReqType())) {
+                // Kiểm tra trạng thái REQ_STATUS 1
+                switch (InvoiceEnum.valueOfByStatus(invTrans.getReqStatus())) {
+                    case PIC_SUBMITTED:
+                        // Lấy người được giao việc là DA
+                        if (checkInvAssign(reqNo,userLoginDto,AssignTypeEnum.DA) != null) {
+                            // Cho thằng DA thực hiện action
+                            commonModifyData = handleDAAction(changeStatusDto,invTrans,userLoginDto);
+                            invTrans.setReqViewFg(StringUtils.READ_FG_NO);
+                        } else {
+                            throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+                                    .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+                        }
+                        break;
+                    case AP_SAVED:
+                        // Lấy người được giao việc là AP
+                        if (checkInvAssign(reqNo,userLoginDto,AssignTypeEnum.AP) != null) {
+                            // Cho thằng AP thực hiện action
+                            commonModifyData = handleAPAction(changeStatusDto,invTrans,userLoginDto);
+                        } else {
+                            throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+                                    .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+                        }
+                        break;
+                    case AP_APPROVED:
+                        // Lấy người được giao việc là AM
+                        if (checkInvAssign(reqNo,userLoginDto,AssignTypeEnum.AM) != null) {
+                            // Cho thằng AM thực hiện action
+                            commonModifyData = handleAMAction(changeStatusDto,invTrans,userLoginDto);
+                        } else {
+                            throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+                                    .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+                        }
+                        break;
+                    default:
+                        throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+                                .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+                }
+            }
+
+//            // Kiểm tra và cập nhật trạng thái READ_FG của INV_ATTM
+//            if (reqStatus != null && (InvoiceEnum.AP.getAction().equals(changeStatusDto.getAction()) ||
+//                    InvoiceEnum.AM.getAction().equals(changeStatusDto.getAction()))) {
+//                checkAndUpdateInvAttm(invTrans, reqStatus,userLoginDto);
+//            }
+
+            // Lưu trạng thái mới vào cơ sở dữ liệu
+            invTransRepository.saveAndFlush(invTrans);
+
+            return commonModifyData;
+        } catch (CommonException ex) {
+            throw ex;
+        } catch (Exception e) {
+            log.error(LogErrorMessConstant.ERROR_MANAGER_RESPONSE_STAFF_CLAIM_INVOICE,
+                    ExceptionUtils.getStackTrace(e));
+            throw e;
+        }
+    }
+    private InvAssign checkInvAssign(String reqNo, UserLoginDto userLoginDto, AssignTypeEnum assignTypeEnum){
+        // Lấy danh sách người được giao việc
+        List<InvAssign> assignList = invAssignRepository.getAllByReqNo(reqNo);
+        InvAssign assigner = assignList.stream()
+                .filter(a -> Objects.equals(a.getAssignType(), assignTypeEnum.getValue()) && a.getAssigner().equals(userLoginDto.getStaffNo()))
+                .findFirst().orElse(null);
+        return assigner;
+    }
+
+    private CommonModifyData history(String reqNo, UserLoginDto userLoginDto, ChangeStatusDto changeStatusDto,
+                                                  RoleIdEnum roleIdEnum, String reqStatus) {
+        InvLogHist invLogHist = new InvLogHist();
+        invLogHist.setReqNo(reqNo);
+        invLogHist.setCompanyCd(userLoginDto.getCompanyCd());
+        invLogHist.setUserName(userLoginDto.getName());
+        invLogHist.setRole(baseMstSettingService.getRoleAdmin(userLoginDto.getUserRoles(),roleIdEnum));
+        invLogHist.setAction(changeStatusDto.getAction().getBeneStatusEnum().getDescription());
+        invLogHist.setReqStatus(reqStatus);
+        invLogHist.setComments(changeStatusDto.getComment());
+        invLogHist.setRegisterField(userLoginDto);
+
+        HistoryDto historyDto = modelMapper.map(invLogHistRepository.saveAndFlush(invLogHist), HistoryDto.class);
+        GenMst genMst = genMstRepository.getByItemCatAndItemCdAndValue(GenMstEnum.INVOICE_APPROVAL.getValue(), ItemCdEnum.REQ_STATUS.name(),
+                reqStatus);
+        historyDto.setReqStatus(genMst.getValueDesc());
+        CommonModifyData commonModifyData=new CommonModifyData();
+        commonModifyData.setReqNo(reqNo);
+        commonModifyData.setHistoryDto(historyDto);
+
+        return commonModifyData;
+    }
+
+
+    private void checkAndUpdateInvAttm(InvTrans invTrans, String reqStatus, UserLoginDto userLoginDto) {
+        // Kiểm tra REQ_TYPE
+        if (InvoiceEnum.ReqTypeEnum.STAFF_CLAIM_HR.getType().equals(invTrans.getReqType()) ||
+                InvoiceEnum.ReqTypeEnum.STAFF_CLAIM.getType().equals(invTrans.getReqType())) {
+            // Kiểm tra trạng thái REQ_STATUS
+            switch (InvoiceEnum.valueOfByStatus(reqStatus)) {
+                case AP_APPROVED:
+                case AM_REJECTED:
+                    // Kiểm tra tất cả INV_ATTM.READ_FG của REQ_NO
+                    boolean allRead = invAttmRepository.countCheckAttmNotRead(invTrans.getReqNo())==StringUtils.ZERO;
+                    if (!allRead) {
+                        // Reset toàn bộ INV_ATTM.READ_FG = 'N'
+                        invAttmRepository.updateReadFgByReqNo(invTrans.getReqNo(), StringUtils.READ_FG_NO, userLoginDto.getName(), DateUtils.getCurrentTimestamp());
+                    }
+                    break;
+            }
+        }
+    }
+
+    private CommonModifyData handleHRCAction(ChangeStatusDto changeStatusDto, InvTrans invTrans,UserLoginDto userLoginDto) throws CommonException {
+        String reqStatus;
+        CommonModifyData commonModifyData ;
+       if (ActionEnum.APPROVED.equals(changeStatusDto.getAction())){
+           reqStatus=InvoiceEnum.HRC_APPROVED.getStatus();
+                // Lưu thông tin hành động vào lịch sử
+           commonModifyData= history(invTrans.getReqNo(), userLoginDto, changeStatusDto, RoleIdEnum.BHR2,reqStatus); // Gọi hàm lưu lịch sử
+        } else if (ActionEnum.REJECTED.equals(changeStatusDto.getAction())) {
+           reqStatus=InvoiceEnum.HRC_REJECTED.getStatus();
+           commonModifyData= history(invTrans.getReqNo(), userLoginDto, changeStatusDto, RoleIdEnum.BHR2,reqStatus);
+       }else {
+           throw new CommonException();
+       }
+       invTrans.setReqStatus(reqStatus);
+        // Reset trạng thái REQ_VIEW_FG của INV_TRANS về 'N' khi approve hoặc reject
+        invTrans.setReqViewFg(StringUtils.READ_FG_NO);
+        // Trả về trạng thái sau khi xử lý
+        return commonModifyData;
+    }
+
+
+    private CommonModifyData handleHRMAction(ChangeStatusDto changeStatusDto,InvTrans invTrans,UserLoginDto userLoginDto) throws CommonException {
+        String reqStatus;
+        CommonModifyData commonModifyData;
+       if (ActionEnum.APPROVED.equals(changeStatusDto.getAction())){
+           reqStatus=InvoiceEnum.HRM_APPROVED.getStatus();
+           commonModifyData= history(invTrans.getReqNo(), userLoginDto, changeStatusDto, RoleIdEnum.BHR1, reqStatus);
+       } else if (ActionEnum.REJECTED.equals(changeStatusDto.getAction())) {
+           reqStatus=InvoiceEnum.HRM_REJECTED.getAction();
+           commonModifyData= history(invTrans.getReqNo(), userLoginDto, changeStatusDto, RoleIdEnum.BHR1, reqStatus);
+       }else {
+           throw new CommonException();
+       }
+       invTrans.setReqStatus(reqStatus);
+        // Reset trạng thái REQ_VIEW_FG của INV_TRANS về 'N' khi approve hoặc reject
+        invTrans.setReqViewFg(StringUtils.READ_FG_NO);
+        // Trả về trạng thái sau khi xử lý
+        return commonModifyData;
+    }
+
+    private CommonModifyData handleDAAction(ChangeStatusDto changeStatusDto,InvTrans invTrans,UserLoginDto userLoginDto) throws CommonException {
+        String reqStatus;
+        CommonModifyData commonModifyData;
+        if (ActionEnum.APPROVED.equals(changeStatusDto.getAction())){
+            reqStatus=InvoiceEnum.DA_APPROVED.getStatus();
+            commonModifyData= history(invTrans.getReqNo(), userLoginDto, changeStatusDto, RoleIdEnum.DAM1, reqStatus); // Gọi hàm lưu lịch sử
+        }else if (ActionEnum.REJECTED.equals(changeStatusDto.getAction())){
+            reqStatus=InvoiceEnum.DA_REJECTED.getStatus();
+            commonModifyData= history(invTrans.getReqNo(), userLoginDto, changeStatusDto, RoleIdEnum.DAM1, reqStatus);
+        }else {
+            throw new CommonException();
+        }
+        invTrans.setReqStatus(reqStatus);
+        // Reset trạng thái REQ_VIEW_FG của INV_TRANS về 'N' khi reject
+        invTrans.setReqViewFg(StringUtils.READ_FG_NO);
+        // Trả về trạng thái sau khi xử lý
+        return commonModifyData;
+    }
+
+    private CommonModifyData handleAPAction(ChangeStatusDto changeStatusDto,InvTrans invTrans,UserLoginDto userLoginDto) throws CommonException {
+      String reqStatus;
+      CommonModifyData commonModifyData;
+        if (ActionEnum.APPROVED.equals(changeStatusDto.getAction())){
+            reqStatus=InvoiceEnum.AP_APPROVED.getStatus();
+            commonModifyData= history(invTrans.getReqNo(), userLoginDto, changeStatusDto, RoleIdEnum.BAP4, reqStatus);
+      } else if (ActionEnum.REJECTED.equals(changeStatusDto.getAction())) {
+            reqStatus=InvoiceEnum.AP_REJECTED.getStatus();
+            commonModifyData= history(invTrans.getReqNo(), userLoginDto, changeStatusDto, RoleIdEnum.BAP4, reqStatus);
+        }else {
+            throw new CommonException();
+        }
+        invTrans.setReqStatus(reqStatus);
+        return commonModifyData;
+    }
+
+    private CommonModifyData handleAMAction(ChangeStatusDto changeStatusDto,InvTrans invTrans,UserLoginDto userLoginDto) throws CommonException {
+       CommonModifyData commonModifyData;
+       String reqStatus;
+        if (ActionEnum.APPROVED.equals(changeStatusDto.getAction())){
+           reqStatus=InvoiceEnum.AM_APPROVED.getStatus();
+            commonModifyData= history(invTrans.getReqNo(), userLoginDto, changeStatusDto, RoleIdEnum.BAM4, reqStatus);
+        }else if (ActionEnum.REJECTED.equals(changeStatusDto.getAction())){
+            reqStatus=InvoiceEnum.AM_REJECTED.getStatus();
+            commonModifyData= history(invTrans.getReqNo(), userLoginDto, changeStatusDto, RoleIdEnum.BAM4, reqStatus);
+        }else {
+            throw new CommonException();
+        }
+        invTrans.setReqStatus(reqStatus);
+        return commonModifyData;
+    }
+
+//    public CommonModifyData approvalStaffInvoice(ChangeStatusDto changeStatusDto, String reqNo) throws CommonException {
+//        try {
+//            String reqStatus = null;
+//            // Lấy thông tin người dùng hiện tại
+//            UserLoginDto userLoginDto = AuthUtils.getCurrentUser();
+//
+//            // Lấy thông tin giao dịch hóa đơn từ cơ sở dữ liệu
+//            List<String> stringList = Arrays.asList(StringUtils.CHAR_1, StringUtils.CHAR_2);
+//            InvTrans invTrans = invTransRepository.getByCompanyCdAndReqNoAndReqTypeIn(userLoginDto.getCompanyCd(), reqNo, stringList)
+//                    .orElseThrow(() -> new CommonException().setStatusCode(HttpStatus.NOT_FOUND)
+//                            .setErrorCode(SystemCodeEnum.ER_SAB1_003.getCode(), messageResource, reqNo));
+//
+//            // Kiểm tra REQ_TYPE
+//            if (InvoiceEnum.ReqTypeEnum.STAFF_CLAIM_HR.getType() == invTrans.getReqType()) {
+//                // Kiểm tra trạng thái REQ_STATUS
+//                switch (InvoiceEnum.valueOfByStatus(invTrans.getReqStatus())) {
+//                    case InvoiceEnum.PIC_SUBMITTED:// status 2
+//                        handleAssignerAction(invTrans, changeStatusDto, userLoginDto, paramMailCodeDto, AssignTypeEnum.HR_C.getValue(), AssignTypeEnum.HR_M.getValue(), reqStatus);
+//                        break;
+//                    case InvoiceEnum.HRC_APPROVED: //status 10
+//                        handleAssignerAction(invTrans, changeStatusDto, userLoginDto, paramMailCodeDto, AssignTypeEnum.HR_M.getValue(), null, reqStatus);
+//                        break;
+//                    case InvoiceEnum.HRM_APPROVED://status 12
+//                        handleAssignerAction(invTrans, changeStatusDto, userLoginDto, paramMailCodeDto, AssignTypeEnum.DA.getValue(), null, reqStatus);
+//                        break;
+//                    case InvoiceEnum.AP_SAVED://status 14
+//                        handleAssignerAction(invTrans, changeStatusDto, userLoginDto, paramMailCodeDto, AssignTypeEnum.AP.getValue(), null, reqStatus);
+//                        break;
+//                    case InvoiceEnum.AP_APPROVED://status 15
+//                        handleAssignerAction(invTrans, changeStatusDto, userLoginDto, paramMailCodeDto, AssignTypeEnum.AM.getValue(), null, reqStatus);
+//                        break;
+//                    default:
+//                        throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+//                                .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+//                }
+//            } else if (InvoiceEnum.ReqTypeEnum.STAFF_CLAIM.getType() == invTrans.getReqType()) {
+//                // Kiểm tra trạng thái REQ_STATUS
+//                switch (InvoiceEnum.valueOfByStatus(invTrans.getReqStatus())) {
+//                    case InvoiceEnum.PIC_SUBMITTED:
+//                        handleAssignerAction(invTrans, changeStatusDto, userLoginDto, paramMailCodeDto, AssignTypeEnum.DA.getValue(), null, reqStatus);
+//                        break;
+//                    case InvoiceEnum.AP_SAVED:
+//                        handleAssignerAction(invTrans, changeStatusDto, userLoginDto, paramMailCodeDto, AssignTypeEnum.AP.getValue(), null, reqStatus);
+//                        break;
+//                    case InvoiceEnum.AP_APPROVED:
+//                        handleAssignerAction(invTrans, changeStatusDto, userLoginDto, paramMailCodeDto, AssignTypeEnum.AM.getValue(), null, reqStatus);
+//                        break;
+//                    default:
+//                        throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+//                                .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+//                }
+//            }
+//
+//            // Lưu trạng thái mới vào cơ sở dữ liệu
+//            invTrans.setReqStatus(reqStatus);
+//            invTransRepository.saveAndFlush(invTrans);
+//
+//            return commonModifyData;
+//        } catch (CommonException ex) {
+//            throw ex;
+//        } catch (Exception e) {
+//            log.error(LogErrorMessConstant.ERROR_MANAGER_RESPONSE_STAFF_CLAIM_INVOICE,
+//                    ExceptionUtils.getStackTrace(e));
+//            throw e;
+//        }
+//    }
+//
+//    private void handleAssignerAction(InvTrans invTrans, ChangeStatusDto changeStatusDto, UserLoginDto userLoginDto, ParamMailCodeDto paramMailCodeDto, int currentAssignerType, Integer nextAssignerType, String reqStatus) throws CommonException {
+//        // Lấy danh sách người được giao việc
+//        List<InvAssign> assignList = invAssignRepository.getAllByReqNo(invTrans.getReqNo());
+//        // Tìm người được giao việc
+//        InvAssign currentAssigner = assignList.stream()
+//                .filter(a -> a.getAssignType() == currentAssignerType && a.getAssigner().equals(userLoginDto.getStaffNo()))
+//                .findFirst().orElse(null);
+//        InvAssign nextAssigner = nextAssignerType != null ? assignList.stream()
+//                .filter(a -> a.getAssignType() == nextAssignerType && a.getAssigner().equals(userLoginDto.getStaffNo()))
+//                .findFirst().orElse(null) : null;
+//        if (currentAssigner != null) {
+//            // Xử lý hành động tương ứng với loại người được giao việc
+//            switch (AssignTypeEnum.valueOfByStatus(String.valueOf(currentAssignerType))) {
+//                case HR_C:
+//                    reqStatus = handleHRCAction(String.valueOf(changeStatusDto.getAction()));
+//                    invTrans.setReqViewFg(StringUtils.READ_FG_NO);
+//                    break;
+//                case HR_M:
+//                    reqStatus = handleHRMAction(String.valueOf(changeStatusDto.getAction()));
+//                    invTrans.setReqViewFg(StringUtils.READ_FG_NO);
+//                    break;
+//                case DA:
+//                    reqStatus = handleDAAction(String.valueOf(changeStatusDto.getAction()));
+//                    invTrans.setReqViewFg(StringUtils.READ_FG_NO);
+//                    break;
+//                case AP:
+//                    reqStatus = handleAPAction(String.valueOf(changeStatusDto.getAction()));
+//                    break;
+//                case AM:
+//                    reqStatus = handleAMAction(String.valueOf(changeStatusDto.getAction()));
+//                    break;
+//            }
+//
+//            // Gửi email thông báo
+//            paramMailCodeDto.setToEmailAddresses(userMstRepository.getMailRequester(userLoginDto.getCompanyCd(), invTrans.getReqNo()));
+//            sendEmail(paramMailCodeDto, userLoginDto, invTrans.getReqNo(), reqStatus);
+//
+//            // Tạo lịch sử hành động
+//            history(invTrans.getReqNo(), userLoginDto, changeStatusDto, currentAssigner.getRoleId(), reqStatus);
+//        } else {
+//            throw new CommonException()
+//                    .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource)
+//                    .setStatusCode(HttpStatus.BAD_REQUEST);
+//        }
+//    }
+//
+//    private void checkAndUpdateInvAttm(InvTrans invTrans, String reqStatus, UserLoginDto userLoginDto) {
+//        // Kiểm tra REQ_TYPE
+//        if (InvoiceEnum.ReqTypeEnum.STAFF_CLAIM_HR.getType() == invTrans.getReqType() ||
+//                InvoiceEnum.ReqTypeEnum.STAFF_CLAIM.getType() == invTrans.getReqType()) {
+//            // Kiểm tra trạng thái REQ_STATUS
+//            switch (reqStatus) {
+//                case GeneralInvoiceEnum.AP_APPROVED.getStatus():
+//                case GeneralInvoiceEnum.AM_REJECTED.getStatus():
+//                    // Kiểm tra tất cả INV_ATTM.READ_FG của REQ_NO
+//                    boolean allRead = invAttmRepository.countCheckAttmNotRead(invTrans.getReqNo()) == StringUtils.ZERO;
+//                    if (!allRead) {
+//                        // Reset toàn bộ INV_ATTM.READ_FG = 'N'
+//                        invAttmRepository.updateReadFgByReqNo(invTrans.getReqNo(), StringUtils.READ_FG_NO, userLoginDto.getName(), DateUtils.getCurrentTimestamp());
+//                    }
+//                    break;
+//            }
+//        }
+//    }
+//
+//    private String handleHRCAction(String action) throws CommonException {
+//        String reqStatus;
+//        switch (action) {
+//            case InvoiceEnum.APPROVED.getAction():
+//                reqStatus = GeneralInvoiceEnum.HRC_APPROVED.getStatus();
+//                break;
+//            case InvoiceEnum.REJECTED.getAction():
+//                reqStatus = GeneralInvoiceEnum.HRC_REJECTED.getStatus();
+//                break;
+//            default:
+//                throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+//                        .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+//        }
+//        return reqStatus;
+//    }
+//
+//    private String handleHRMAction(String action) throws CommonException {
+//        String reqStatus;
+//        switch (action) {
+//            case InvoiceEnum.APPROVED.getAction():
+//                reqStatus = GeneralInvoiceEnum.HRM_APPROVED.getStatus();
+//                break;
+//            case InvoiceEnum.REJECTED.getAction():
+//                reqStatus = GeneralInvoiceEnum.HRM_REJECTED.getStatus();
+//                break;
+//            default:
+//                throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+//                        .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+//        }
+//        return reqStatus;
+//    }
+//
+//    private String handleDAAction(String action) throws CommonException {
+//        String reqStatus;
+//        switch (action) {
+//            case InvoiceEnum.APPROVED.getAction():
+//                reqStatus = GeneralInvoiceEnum.DA_APPROVED.getStatus();
+//                break;
+//            case InvoiceEnum.REJECTED.getAction():
+//                reqStatus = GeneralInvoiceEnum.DA_REJECTED.getStatus();
+//                break;
+//            default:
+//                throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+//                        .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+//        }
+//        return reqStatus;
+//    }
+//
+//    private String handleAPAction(String action) throws CommonException {
+//        String reqStatus;
+//        switch (action) {
+//            case InvoiceEnum.APPROVED.getAction():
+//                reqStatus = GeneralInvoiceEnum.AP_APPROVED.getStatus();
+//                break;
+//            case InvoiceEnum.REJECTED.getAction():
+//                reqStatus = GeneralInvoiceEnum.AP_REJECTED.getStatus();
+//                break;
+//            default:
+//                throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+//                        .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+//        }
+//        return reqStatus;
+//    }
+//
+//    private String handleAMAction(String action) throws CommonException {
+//        String reqStatus;
+//        switch (action) {
+//            case InvoiceEnum.APPROVED.getAction():
+//                reqStatus = GeneralInvoiceEnum.AM_APPROVED.getStatus();
+//                break;
+//            case InvoiceEnum.REJECTED.getAction():
+//                reqStatus = GeneralInvoiceEnum.AM_REJECTED.getStatus();
+//                break;
+//            default:
+//                throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+//                        .setErrorCode(SystemCodeEnum.ER_SAB1_004.getCode(), messageResource);
+//        }
+//        return reqStatus;
+//    }
+
+
+
+
+
+
+//    @Override
+//    @Transactional(rollbackFor = {Exception.class, Throwable.class})
+//    public ModifyStaffResDto modifyStaffResDto(String reqNo, ChangeStatusDto changeStatusDto) throws CommonException {
+//        try {
+//            // Lấy thông tin người dùng hiện tại
+//            UserLoginDto userLoginDto = AuthUtils.getCurrentUser();
+//
+//            // Tìm giao dịch hóa đơn dựa trên số yêu cầu
+//            InvTrans invTrans = invTransRepository.getByCompanyCdAndReqNo(userLoginDto.getCompanyCd(), reqNo)
+//                    .orElseThrow(() -> new CommonException().setStatusCode(HttpStatus.NOT_FOUND)
+//                            .setErrorCode(SystemCodeEnum.ER_0002.getCode(), messageResource, reqNo));
+//
+//            // Kiểm tra loại yêu cầu và trạng thái yêu cầu
+//            if (invTrans.getReqType() == 2) { // Staff Claim HR
+//                if (invTrans.getReqStatus() == 2) { // PIC Submitted
+//                    // Kiểm tra người phê duyệt là HRC
+//                    InvAssign hrcAssign = invAssignRepository.getByReqNoAndAssignTypeAndAssigner(reqNo, 1, userLoginDto.getStaffNo())
+//                            .orElse(null);
+//                    if (hrcAssign != null) {
+//                        // Reset INV_TRANS.REQ_VIEW_FG = 'N' khi approve/reject
+//                        invTrans.setReqViewFg("N");
+//                        // Kiểm tra hành động là reject hay approve
+//                        if (changeStatusDto.getAction() == ActionEnum.REJECT) {
+//                            // Reset toàn bộ INV_ATTM của REQ_NO -> READ_FG = 'N'
+//                            invAttmRepository.updateReadFgByReqNo(reqNo, "N");
+//                            // Thực hiện hành động reject
+//                            rejectStaffClaim(reqNo, changeStatusDto, userLoginDto);
+//                        } else if (changeStatusDto.getAction() == ActionEnum.APPROVE) {
+//                            // Kiểm tra tất cả INV_ATTM của REQ_NO đều = 'Y'
+//                            boolean allRead = invAttmRepository.countCheckAttmNotRead(reqNo) == 0;
+//                            if (allRead) {
+//                                // Thực hiện hành động approve
+//                                approveStaffClaim(reqNo, changeStatusDto, userLoginDto);
+//                            } else {
+//                                // Xử lý lỗi do không tất cả INV_ATTM đã được đọc
+//                                throw new CommonException().setStatusCode(HttpStatus.BAD_REQUEST)
+//                                        .setErrorCode(SystemCodeEnum.ERROR.getCode(), messageResource, "Not all attachments have been read");
+//                            }
+//                        }
+//                    } else {
+//                        // Chuyển sang assign_type = 2 (HRM)
+//                        assignHRM(reqNo, userLoginDto);
+//                    }
+//                } else if (invTrans.getReqStatus() == 10) { // HRC Approved
+//                    // Kiểm tra người phê duyệt là HRM
+//                    InvAssign hrmAssign = invAssignRepository.getByReqNoAndAssignTypeAndAssigner(reqNo, 2, userLoginDto.getStaffNo())
+//                            .orElse(null);
+//                    if (hrmAssign != null) {
+//                        // Logic cho HRM
+
+
+
+
+
+
+    private ParamMailCodeDto prepareParamMailCode(InvTrans invTrans, ChangeStatusDto changeStatusDto,
+                                                  UserLoginDto userLoginDto, String reqNo) throws CommonException {
+        ParamMailCodeDto paramCode = new ParamMailCodeDto();
+        paramCode.setReqNo(invTrans.getReqNo());
+        paramCode.setRequestType(invTrans.getReqType());
+        paramCode.setUserCreated(invLogHistRepository.getUserCreated(userLoginDto.getCompanyCd(), reqNo,
+                GeneralInvoiceEnum.SUBMITTED.getStatus()));
+        paramCode.setResult(changeStatusDto.getAction().getGeneralInvoiceEnum().getDescription());
+        paramCode.setComments(changeStatusDto.getComment());
+        paramCode.setLinkParam(webHost + MailConstant.INVOICE_LISTING);
+        return paramCode;
+    }
+
+    private InvAssign getAssigner(String staffNo, String reqNo) {
+        List<InvAssign> assignList = invAssignRepository.getAllByReqNo(reqNo);
+        return assignList.stream()
+                .filter(a -> a.getAssigner().equalsIgnoreCase(staffNo))
+                .findFirst()
+                .orElse(null);
+    }
+
+
+
+
+
+//    private void sendEmail(ParamMailCodeDto paramMailCodeDto, String reqNo, UserLoginDto userLoginDto, InvoiceEnum status, List<InvAssign> invAssignList) throws CommonException {
+
+//        switch (status){
+//            case DA_APPROVED:
+//                InvAssign invAssign = invAssignList.stream().filter(i->Objects.equals(i.getAssignType(), AssignTypeEnum.AP.getValue())).findFirst().orElse(null);
+//                if (invAssign != null) {
+//                    User recipient = getUserByEmail(daAssign.getEmail());
+//                    if (recipient != null) {
+//                        mailSystemService(recipient.getEmail(), "Invoice Approval Request (DA Approved)", "Your invoice has been DA approved.");
+//                    }
+//
+//                    // Thực hiện truy vấn SQL để lấy thông tin cần thiết từ cơ sở dữ liệu
+//                    String toEmailQuery = "SELECT [USER_MST].[MAIL_ADDRESS] FROM [USER_MST] WHERE [USER_MST].[STAFF_NO] IN (SELECT [REQUESTER] FROM [INV_TRANS] WHERE [REQ_NO] = ?)";
+//                    String ccEmailQuery = "SELECT [USER_MST].[MAIL_ADDRESS] FROM [USER_MST] WHERE [USER_MST].[STAFF_NO] IN (SELECT [HR_CHECKER] FROM [INV_LOG_HIST] WHERE [REQ_NO] = ? AND [REQ_STATUS] = ?)";
+//                    String bodyQuery = "SELECT [INV_LOG_HIST].[REQ_NO], [INV_TRANS].[REQ_TYPE], [INV_TRANS].[GROUP_TYPE], [USER_MST].[NAME] AS [Person-In-Charge], [INV_LOG_HIST].[USER_NAME] AS [HR_Checker], [INV_LOG_HIST].[ACTION] AS [Result], [INV_LOG_HIST].[COMMENTS] AS [Comments] FROM [INV_LOG_HIST] LEFT JOIN [USER_MST] ON [USER_MST].[STAFF_NO] = [INV_LOG_HIST].[INSERTED_BY] LEFT JOIN [INV_TRANS] ON [INV_TRANS].[REQ_NO] = [INV_LOG_HIST].[REQ_NO] WHERE [INV_LOG_HIST].[REQ_NO] = ? AND [INV_LOG_HIST].[REQ_STATUS] = ?";
+//
+//                    // Thực hiện truy vấn SQL và lấy kết quả
+//                    Set<String>toEmailAddress = BaseQueryRepository(toEmailQuery, reqNo);
+//                    Set<String> ccEmailAddress = BaseQueryRepository(ccEmailQuery, reqNo, reqStatus);
+//                    String body = BaseQueryRepository(bodyQuery, reqNo, reqStatus);
+//
+//                    // Set thông tin địa chỉ email và nội dung email vào paramCode
+//                    paramMailCodeDto.setToEmailAddresses(toEmailAddress);
+//                    paramMailCodeDto.setCcEmailAddresses(ccEmailAddress);
+//                    paramMailCodeDto.setComments();
+//
+//                    // Gửi email
+//                    mailSystemService.generateSendMail(ModuleApprovalEnum.INVOICE, ScreenCodeEnum.SAB3006, paramMailCodeDto);
+//                }
+//                break;
+//            case DA_REJECTED:
+//            case HRC_APPROVED:
+//            case HRC_REJECTED:
+//            case HRM_APPROVED:
+//            case HRM_REJECTED:
+//            case AP_APPROVED:
+//            case AP_REJECTED:
+//            case AM_APPROVED:
+//            case AM_REJECTED:
+//        }
+//        paramMailCodeDto.setReqStatus(reqStatus);
+//        mailSystemService.generateSendMail(ModuleApprovalEnum.INVOICE, ScreenCodeEnum.SAB3004, paramMailCodeDto);
+//    }
+
+//        switch (status) {
+//            case DA_APPROVED:
+//                handleDAApproved(reqNo, reqStatus, paramMailCodeDto);
+//                break;
+//            case DA_REJECTED:
+//                handleDARejected(reqNo, reqStatus, paramMailCodeDto);
+//                break;
+//            case HRC_APPROVED:
+//                handleHRCApproved(reqNo, reqStatus, paramMailCodeDto);
+//                break;
+//            case HRC_REJECTED:
+//                handleHRCRejected(reqNo, reqStatus, paramMailCodeDto);
+//                break;
+//            case HRM_APPROVED:
+//                handleHRMApproved(reqNo, reqStatus, paramMailCodeDto);
+//                break;
+//            case HRM_REJECTED:
+//                handleHRMRejected(reqNo, reqStatus, paramMailCodeDto);
+//                break;
+//            case AP_APPROVED:
+//                handleAPApproved(reqNo, reqStatus, paramMailCodeDto);
+//                break;
+//            case AP_REJECTED:
+//                handleAPRejected(reqNo, reqStatus, paramMailCodeDto);
+//                break;
+//            case AM_APPROVED:
+//                handleAMApproved(reqNo, reqStatus, paramMailCodeDto);
+//                break;
+//            case AM_REJECTED:
+//                handleAMRejected(reqNo, reqStatus, paramMailCodeDto);
+//                break;
+//            default:
+//                // Trạng thái không được xử lý
+//                break;
+//        }
+//
+//    }
+
+
+
+
+    private void mergeSetDocumentGeneralInvoice(InvTrans invTrans) throws CommonException {
+        Map<String, FileItemMergeSet> mapFileInvNo = staffClaimPDFService.createEntryFileInvoiceStaffHrPDF(invTrans);
+        FileItemMergeSet fileItemHistoryInvoice = invoiceFileService.createHistoryFileInvoice(invTrans.getReqNo());
+        for (Entry<String, FileItemMergeSet> entry : mapFileInvNo.entrySet()) {
+            List<FileItemMergeSet> fileItemMergeSets = new ArrayList<>();
+            fileItemMergeSets.add(entry.getValue());
+            fileItemMergeSets.add(fileItemHistoryInvoice);
+            fileSystemService.createMergeSetDocument(ModuleFileSystemEnum.INVOICE, invTrans.getReqNo(), entry.getKey(), fileItemMergeSets);
+            fileSystemService.deleteFileByFullPath(entry.getValue().getFilePath());
+        }
+        fileSystemService.deleteFileByFullPath(fileItemHistoryInvoice.getFilePath());
+    }
+}
